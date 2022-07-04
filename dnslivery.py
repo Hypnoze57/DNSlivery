@@ -6,6 +6,7 @@ import argparse
 import signal
 import re
 import base64
+import dns.resolver as dresolv
 from scapy.all import *
 
 banner = """
@@ -62,9 +63,9 @@ def dns_handler(data):
             # remove domain part of fqdn and split the different parts of hostname
             hostname = re.sub('\.%s\.$' % args.domain, '', dnsqr.qname.decode()).split('.')
 
-            # check if hostname match existing file 
+            # check if hostname match existing file
             if len(hostname) > 0 and hostname[0] in chunks:
-                
+
                 # launcher response (default): file.domain
                 if len(hostname) == 1: hostname.append('print')
 
@@ -94,7 +95,32 @@ def dns_handler(data):
 
                 response_pkt = IP(id=ip.id, src=ip.dst, dst=ip.src) / UDP(sport=udp.dport, dport=udp.sport) / DNS(id=dns.id, qr=1, rd=1, ra=1, rcode=rcode, qd=dnsqr, an=an, ns=ns)
                 send(response_pkt, verbose=0, iface=args.interface)
-        
+        else:
+            # DNS QNAME Minimized
+            # https://datatracker.ietf.org/doc/html/rfc7816.html
+            # https://nelsonslog.wordpress.com/2021/12/16/underscore-dns-queries/
+
+            qname_t = dnsqr.qname.decode().split('.')
+            if len(qname_t) > 0 and qname_t[0] == '_':
+                if args.verbose:
+                    log('Received QNAME Minimized query, preparing answer!')
+                
+                delivery_domain = '.'.join(qname_t[1:])
+                try:
+                    NS_IP = dresolv.resolve(args.nameserver)[0].to_text()
+                except:
+                    log("Unable to resolve IP of NS (%s)" % (args.nameserver), "debug")
+                    return
+
+                #log('Domain: %s' % (delivery_domain))
+                #log("NS IP: %s" % (NS_IP))
+
+                an = DNSRR(rrname=dnsqr.qname, type=dnsqr.qtype, rdata=NS_IP, ttl=1)
+                response_pkt = IP(id=ip.id, src=ip.dst, dst=ip.src) / UDP(sport=udp.dport, dport=udp.sport) / DNS(id=dns.id, qr=1, rd=1, ra=1, rcode=0, qd=dnsqr, an=an)
+
+                send(response_pkt, verbose=0, iface=args.interface)
+                log('QNAME Minimized answer sent! Waiting for new request')
+
 
 if __name__ == '__main__':
     # parse args
@@ -116,7 +142,7 @@ if __name__ == '__main__':
 
     # verify path exists and is readable
     abspath = os.path.abspath(args.path)
-    
+
     if not os.path.exists(abspath) or not os.path.isdir(abspath):
         log('Path %s does not exist or is not a directory' % abspath, '-')
         sys.exit(-1)
@@ -179,5 +205,8 @@ if __name__ == '__main__':
 
     # listen for DNS query
     log('Listening for DNS queries...')
+
+    udpserver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udpserver.bind(('0.0.0.0',53)) #listen to 53 port
 
     while True: dns_listener = sniff(filter='udp dst port 53', iface=args.interface, prn=dns_handler)
